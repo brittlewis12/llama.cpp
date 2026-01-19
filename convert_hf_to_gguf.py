@@ -1045,6 +1045,9 @@ class TextModel(ModelBase):
         if chkhsh == "9ca2dd618e8afaf09731a7cf6e2105b373ba6a1821559f258b272fe83e6eb902":
             # ref: https://huggingface.co/zai-org/GLM-4.5-Air
             res = "glm4"
+        if chkhsh == "cdf5f35325780597efd76153d4d1c16778f766173908894c04afc20108536267":
+            # ref: https://huggingface.co/zai-org/GLM-4.7-Flash
+            res = "glm4"
         if chkhsh == "1431a23e583c97432bc230bff598d103ddb5a1f89960c8f1d1051aaa944d0b35":
             # ref: https://huggingface.co/sapienzanlp/Minerva-7B-base-v1.0
             res = "minerva-7b"
@@ -7645,7 +7648,8 @@ class DeepseekV2Model(TextModel):
 
             kv_b = data_torch.view(n_head_kv, v_head_dim + qk_nope_head_dim, data_torch.shape[-1])
             k_b, v_b = torch.split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
-            k_b = k_b.transpose(1, 2)
+            k_b = k_b.transpose(1, 2).contiguous()
+            v_b = v_b.contiguous()
 
             return [
                 (self.map_tensor_name(name_kb), k_b),
@@ -8441,6 +8445,161 @@ class Glm4MoeModel(TextModel):
         super().prepare_tensors()
         if self._experts is not None:
             # flatten `list[dict[str, Tensor]]` into `list[str]`
+            experts = [k for d in self._experts for k in d.keys()]
+            if len(experts) > 0:
+                raise ValueError(f"Unprocessed experts: {experts}")
+
+
+@ModelBase.register("Glm4MoeLiteForCausalLM")
+class Glm4MoeLiteModel(TextModel):
+    """GLM-4 MoE Lite with Multi-head Latent Attention (MLA)"""
+    model_arch = gguf.MODEL_ARCH.GLM4_MOE_LITE
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # GLM4_MOE_LITE has num_hidden_layers + num_nextn_predict_layers
+        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def set_vocab(self):
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        tokens, toktypes, tokpre = self.get_vocab_base()
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(tokpre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        # Special tokens for GLM4.7
+        special_vocab._set_special_token("bos", tokenizer.get_added_vocab().get("[gMASK]"))
+        special_vocab._set_special_token("eos", tokenizer.get_added_vocab().get("<|endoftext|>"))
+        special_vocab._set_special_token("eot", tokenizer.get_added_vocab().get("<|user|>"))
+        special_vocab._set_special_token("unk", tokenizer.get_added_vocab().get("<|endoftext|>"))
+        special_vocab._set_special_token("eom", tokenizer.get_added_vocab().get("<|observation|>"))
+
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def set_gguf_parameters(self):
+        # MLA converts to MQA (1 KV head) with larger heads
+        self.hparams["num_key_value_heads"] = 1
+
+        super().set_gguf_parameters()
+        hparams = self.hparams
+
+        # MLA parameters
+        if "q_lora_rank" in hparams and hparams["q_lora_rank"] is not None:
+            self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+        self.gguf_writer.add_kv_lora_rank(hparams["kv_lora_rank"])
+
+        # Key/Value lengths for MLA
+        self.gguf_writer.add_key_length(hparams["kv_lora_rank"] + hparams["qk_rope_head_dim"])
+        self.gguf_writer.add_value_length(hparams["kv_lora_rank"])
+        self.gguf_writer.add_key_length_mla(hparams["qk_nope_head_dim"] + hparams["qk_rope_head_dim"])
+        self.gguf_writer.add_value_length_mla(hparams["v_head_dim"])
+
+        # RoPE dimension
+        self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+
+        # MoE parameters
+        if (n_routed_experts := hparams.get("n_routed_experts")) is not None:
+            self.gguf_writer.add_expert_count(n_routed_experts)
+        if (moe_intermediate_size := hparams.get("moe_intermediate_size")) is not None:
+            self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
+        if (n_shared_experts := hparams.get("n_shared_experts")) is not None:
+            self.gguf_writer.add_expert_shared_count(n_shared_experts)
+        if (first_k_dense_replace := hparams.get("first_k_dense_replace")) is not None:
+            self.gguf_writer.add_leading_dense_block_count(first_k_dense_replace)
+
+        # Expert gating function (sigmoid for GLM4)
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+
+        # Expert scaling
+        if (routed_scaling_factor := hparams.get("routed_scaling_factor")) is not None:
+            self.gguf_writer.add_expert_weights_scale(routed_scaling_factor)
+        if (norm_topk_prob := hparams.get("norm_topk_prob")) is not None:
+            self.gguf_writer.add_expert_weights_norm(norm_topk_prob)
+
+        # NextN/MTP prediction layers
+        if (num_nextn_predict_layers := hparams.get("num_nextn_predict_layers")) is not None:
+            self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
+
+    _experts: list[dict[str, Tensor]] | None = None
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Handle embedding
+        if name == "model.embed_tokens.weight":
+            return [(self.map_tensor_name("token_embd.weight"), data_torch)]
+
+        # Note: GLM4_MOE_LITE includes NextN layers (num_nextn_predict_layers) at the end
+        # These are full transformer layers + extra NextN tensors, so we don't skip them
+
+        # Handle MLA KV projection split (kv_b_proj -> k_b_proj + v_b_proj)
+        # MLA with absorption optimization needs k_b transposed
+        if "self_attn.kv_b_proj" in name:
+            # Use num_attention_heads since kv_b_proj produces outputs for all heads
+            n_head = self.hparams["num_attention_heads"]
+            v_head_dim = self.hparams["v_head_dim"]
+            qk_nope_head_dim = self.hparams["qk_nope_head_dim"]
+
+            assert data_torch.shape[0] == n_head * (v_head_dim + qk_nope_head_dim), \
+                f"kv_b_proj size mismatch: {data_torch.shape[0]} != {n_head} * ({v_head_dim} + {qk_nope_head_dim})"
+
+            # Reshape to (n_head, v_head_dim + qk_nope_head_dim, kv_lora_rank)
+            kv_b = data_torch.view(n_head, v_head_dim + qk_nope_head_dim, data_torch.shape[-1])
+            # Split into k_b (n_head, qk_nope_head_dim, kv_lora_rank) and v_b (n_head, v_head_dim, kv_lora_rank)
+            k_b, v_b = torch.split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
+            # Transpose k_b for absorption optimization: (n_head, kv_lora_rank, qk_nope_head_dim)
+            k_b = k_b.transpose(1, 2).contiguous()
+            v_b = v_b.contiguous()
+
+            name_kb = name.replace("kv_b_proj", "k_b_proj")
+            name_vb = name.replace("kv_b_proj", "v_b_proj")
+
+            return [
+                (self.map_tensor_name(name_kb), k_b),
+                (self.map_tensor_name(name_vb), v_b),
+            ]
+
+        # Handle routed experts
+        if "mlp.experts" in name:
+            n_experts = self.hparams["n_routed_experts"]
+            assert bid is not None
+
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+
+            self._experts[bid][name] = data_torch
+
+            if len(self._experts[bid]) >= n_experts * 3:
+                tensors: list[tuple[str, Tensor]] = []
+
+                for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                    datas: list[Tensor] = []
+                    for xid in range(n_experts):
+                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                        datas.append(self._experts[bid][ename])
+                        del self._experts[bid][ename]
+
+                    data_torch = torch.stack(datas, dim=0)
+                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                    new_name = self.map_tensor_name(merged_name)
+                    tensors.append((new_name, data_torch))
+                return tensors
+            else:
+                return []
+
+        # Handle e_score_correction_bias
+        if name.endswith("e_score_correction_bias"):
+            name = name.replace("e_score_correction_bias", "e_score_correction.bias")
+
+        new_name = self.map_tensor_name(name)
+        return [(new_name, data_torch)]
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._experts is not None:
             experts = [k for d in self._experts for k in d.keys()]
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
