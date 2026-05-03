@@ -4792,6 +4792,17 @@ class Qwen3MoeModel(Qwen2MoeModel):
 class Qwen3NextModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3NEXT
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Extend block_count by the number of MTP predict layers so the tensor_map
+        # has slots for the trailing MTP block (blk.<n_base>.* / blk.<n_base>.nextn.*).
+        # Without this, remapped mtp.* tensors target a bid that is out of range and
+        # get_tensor_name_map rejects them. Rebuild tensor_map after the bump.
+        n_mtp = int(self.hparams.get("mtp_num_hidden_layers", 0) or 0)
+        if n_mtp > 0:
+            self.block_count += n_mtp
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_ssm_conv_kernel(self.hparams["linear_conv_kernel_dim"])
@@ -4800,13 +4811,31 @@ class Qwen3NextModel(Qwen2MoeModel):
         self.gguf_writer.add_ssm_time_step_rank(self.hparams["linear_num_value_heads"])
         self.gguf_writer.add_ssm_inner_size(self.hparams["linear_value_head_dim"] * self.hparams["linear_num_value_heads"])
         self.gguf_writer.add_full_attention_interval(self.hparams.get("full_attention_interval", 4))
+        # Persist the MTP layer count. Gated on n_mtp > 0 so non-MTP
+        # Qwen3-Next variants are unaffected; uses the actual hparam
+        # value rather than hardcoding 1 for forward-compatibility with
+        # any future N-MTP-layer Qwen variants.
+        n_mtp = int(self.hparams.get("mtp_num_hidden_layers", 0) or 0)
+        if n_mtp > 0:
+            self.gguf_writer.add_nextn_predict_layers(n_mtp)
         if (rope_dim := self.hparams.get("head_dim")) is None:
             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.hparams.get("partial_rotary_factor", 0.25)))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        if name.startswith("mtp"):
-            return  # ignore MTP layers for now
+        if name.startswith("mtp."):
+            n_base = self.hparams["num_hidden_layers"]
+            if ".layers." in name:
+                name = name.replace("mtp.layers.0", f"model.layers.{n_base}")
+            else:
+                remapper = {
+                    "mtp.fc":                    f"model.layers.{n_base}.eh_proj",
+                    "mtp.pre_fc_norm_embedding": f"model.layers.{n_base}.enorm",
+                    "mtp.pre_fc_norm_hidden":    f"model.layers.{n_base}.hnorm",
+                    "mtp.norm":                  f"model.layers.{n_base}.shared_head.norm",
+                }
+                stem, _, ext = name.rpartition(".")
+                name = remapper[stem] + "." + ext
         if name.endswith(".A_log"):
             data_torch = -torch.exp(data_torch)
         elif name.endswith(".dt_bias"):
