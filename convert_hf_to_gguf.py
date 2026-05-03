@@ -1529,6 +1529,12 @@ class TextModel(ModelBase):
         if chkhsh == "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4":
             # ref: https://huggingface.co/Qwen/Qwen3.5-9B-Instruct
             res = "qwen35"
+        if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
+            # ref: https://huggingface.co/Qwen/Qwen3.6-27B
+            # Qwen3.6 family (incl. 35B-A3B) ships an updated tokenizer with
+            # \p{M} (Unicode mark category) in the pre-tokenizer regex.
+            # Functionally same Qwen2Tokenizer family for ggml purposes.
+            res = "qwen35"
         if chkhsh == "b4b8ca1f9769494fbd956ebc4c249de6131fb277a4a3345a7a92c7dd7a55808d":
             # ref: https://huggingface.co/jdopensource/JoyAI-LLM-Flash
             res = "joyai-llm"
