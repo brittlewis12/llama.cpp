@@ -565,6 +565,10 @@ extern "C" {
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
+    // Get a model tensor by name (e.g. "output.weight", "output_norm.weight").
+    // Returns nullptr if the tensor is not found.
+    LLAMA_API const struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
+
     // Returns the number of classifier outputs (only valid for classifier models)
     // Undefined behavior for non-classifier models
     LLAMA_API uint32_t llama_model_n_cls_out(const struct llama_model * model);

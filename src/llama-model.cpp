@@ -2187,6 +2187,10 @@ uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;
 }
 
+const struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name) {
+    return model->get_tensor(name);
+}
+
 const char * llama_model_cls_label(const struct llama_model * model, uint32_t i) {
     if (i < model->classifier_labels.size()) {
         return model->classifier_labels[i].c_str();
